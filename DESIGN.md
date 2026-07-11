@@ -1,7 +1,7 @@
 # Android Automotive 媒体扫描系统设计方案
 
-> **版本**: v1.0  
-> **状态**: 设计阶段  
+> **版本**: v1.1  
+> **状态**: 已同步 PRD V1.2  
 > **目标平台**: Android Automotive OS (API 28+)  
 > **部署方式**: `/system/priv-app/MediaScanner/MediaScanner.apk`
 
@@ -241,7 +241,7 @@ MediaScanner/
 
 | 特性   | 方案                                         |
 |------|--------------------------------------------|
-| 进程   | `android:process=":scanner"` 独立进程          |
+| 进程   | 独立 APK，天然独立进程，扫描任务通过 Kotlin Coroutines (Dispatchers.IO) 异步执行 |
 | 启动方式 | `startService()` + `bindService()`         |
 | 前台服务 | `foregroundServiceType="dataSync"`，防止被系统杀死 |
 | 生命周期 | 跟随 Application，开机自启动                       |
@@ -311,6 +311,7 @@ oneway interface IMediaScanCallback {
 ```kotlin
 data class StorageVolume(
     val id: String,           // 唯一标识 "primary" | "usb:XXXX-XXXX"
+    val uuid: String?,        // 卷身份标识（文件系统 UUID / 设备 serial），用于识别同设备重新插入
     val path: String,         // 挂载路径 "/storage/XXXX-XXXX"
     val label: String,        // 显示名称 "USB Drive"
     val type: VolumeType,     // 存储类型
@@ -399,25 +400,27 @@ enum class Priority(val value: Int) {
                            │
                     ┌──────▼──────┐
                     │  Dispatcher  │
+                    │ (时间片轮转)  │
                     └──────┬──────┘
                            │
               ┌────────────┼────────────┐
               │            │            │
               ▼            ▼            ▼
          ┌─────────┐ ┌─────────┐ ┌─────────┐
-         │ Worker 1│ │ Worker 2│ │ Worker N│
-         │ (Core)  │ │ (Core)  │ │ (Idle)  │
+         │ 时间片1  │ │ 时间片2  │ │ 时间片3  │
+         │ (卷A)   │ │ (卷B)   │ │ (卷A)   │
          └─────────┘ └─────────┘ └─────────┘
          
-         线程池配置:
-         - corePoolSize: 1
-         - maxPoolSize: 2
-         - 超过 2 个任务排队等待
+         调度配置:
+         - 单 Worker 线程
+         - 时间片粒度: 默认 5 秒
+         - 时间片到期保存上下文，切换下一卷
+         - 无锁设计，无 IO 竞争
 ```
 
 **关键设计决策**:
 
-1. **Worker 数量限制**: 最多 2 个并发扫描线程，防止 USB IO 竞争导致系统卡顿
+1. **单 Worker 时间片轮转**: 唯一扫描线程按时间片（默认 5s）交替服务各卷，避免多线程 USB IO 竞争
 2. **WorkManager 集成**: 利用 WorkManager 保证任务在进程被杀后恢复
 3. **唯一性约束**: `ExistingWorkPolicy.KEEP` 确保同一 Volume 不会重复扫描
 4. **进度通知**: Worker 通过 `setProgress()` 上报进度，UI 通过 LiveData/Flow 观察
@@ -740,10 +743,11 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
          ▼
 ┌──────────────────┐
 │  ScanScheduler    │
-│  1. 创建 ScanTask  │
-│     type=FULL_SCAN │
-│     priority=2     │
-│  2. 入队           │
+│  1. 检查 Volume 身份│
+│     (UUID/serial)  │
+│  2. 已知卷→增量扫描 │
+│     新卷→全量扫描  │
+│  3. 入队           │
 └────────┬─────────┘
          │
          ▼
@@ -834,12 +838,12 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
 ┌──────────────────────────────┐
 │  StorageManager               │
 │  1. 更新 Volume state→REMOVED │
-│  2. 或直接删除 Volume 记录     │
-│  3. 通知 UI 刷新              │
+│     (软删除，保留 scan_snapshot)│
+│  2. 通知 UI 刷新              │
 └──────────────────────────────┘
 ```
 
-**关键要点**: 拔出时必须在同一个数据库事务中完成 `停止任务 → 删除媒体数据 → 更新 Volume 状态`
+**关键要点**: 拔出时必须在同一个数据库事务中完成 `停止任务 → 删除媒体数据 → Volume 软删除（保留 scan_snapshot）`，支撑重新插入时的增量恢复。
 ，保证数据一致性。
 
 ### 6.3 开机恢复流程
@@ -952,11 +956,11 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
      ┌─────────────┼─────────────┐
      │             │             │
      ▼             ▼             ▼
-┌─────────┐  ┌─────────┐  ┌──────────────┐
-│Scanner  │  │Scanner  │  │  Room Query  │
-│Worker 1 │  │Worker 2 │  │  (Dispatchers│
-│(IO)     │  │(IO)     │  │   .IO)       │
-└─────────┘  └─────────┘  └──────────────┘
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Scan Worker  │  │ Room Query   │  │ AIDL Callback│
+│ (单线程, IO) │  │ (Dispatchers │  │ (Dispatchers │
+│ 时间片轮转    │  │  .IO)        │  │  .Main)       │
+└──────────────┘  └──────────────┘  └──────────────┘
 ```
 
 ### 7.2 优化措施
@@ -969,7 +973,7 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
 | **索引优化**                      | path(UNIQUE), volume_id, media_type, date_modified | 查询速度提升 50x   |
 | **MediaMetadataRetriever 池化** | 对象池复用，避免重复创建                                       | 解析速度提升 30%   |
 | **跳过无关目录**                    | 预定义排除列表 (cache, thumbnails, Android 等)             | 遍历文件数减少 40%  |
-| **Worker 数量控制**               | 最多 2 个并发 Worker                                    | 避免 USB IO 竞争 |
+| **单线程时间片轮转**               | 唯一扫描线程按时间片交替扫描多卷，保存/恢复上下文 | 消除 IO 竞争，无锁设计 |
 | **进度通知节流**                    | 每 500ms 最多通知一次进度                                   | 减少 IPC 开销    |
 
 ### 7.3 大容量设备策略
@@ -1034,9 +1038,10 @@ android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
 | 接口              | 权限保护           | 说明            |
 |-----------------|----------------|---------------|
-| ContentProvider | `signature` 级别 | 仅同签名应用可访问     |
-| AIDL Service    | `signature` 级别 | 仅同签名应用可绑定     |
+| ContentProvider | `signatureOrSystem` + 包名白名单 | 系统签名应用 + 白名单授权应用可访问 |
+| AIDL Service    | `signatureOrSystem` + 包名白名单 | 系统签名应用 + 白名单授权应用可绑定 |
 | 文件访问            | 系统文件权限         | priv-app 自动获得 |
+| 白名单配置       | `/system/etc/media_scanner_allowed_packages.xml` | ROM 编译时固化，OTA 更新 |
 
 ---
 
