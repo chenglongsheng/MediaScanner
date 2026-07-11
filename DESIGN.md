@@ -1,7 +1,7 @@
 # Android Automotive 媒体扫描系统设计方案
 
-> **版本**: v1.1  
-> **状态**: 已同步 PRD V1.2  
+> **版本**: v1.2  
+> **状态**: 已同步 PRD V1.3（新增卷发现策略抽象化）  
 > **目标平台**: Android Automotive OS (API 28+)  
 > **部署方式**: `/system/priv-app/MediaScanner/MediaScanner.apk`
 
@@ -171,6 +171,7 @@ Android Automotive 系统裁剪了原生 Android 的 `MediaScannerService` 和 `
 3. **数据驱动**: 扫描结果通过数据库持久化，UI 通过 ContentProvider 观察数据变化
 4. **异步优先**: 所有 IO 操作异步执行，不阻塞主线程
 5. **容错设计**: 单个文件解析失败不影响整体扫描流程
+6. **策略可替换**: 卷发现、格式检测等平台差异点通过接口抽象，支持运行时切换实现，适配不同供应商的车载 ROM
 
 ---
 
@@ -191,6 +192,11 @@ MediaScanner/
 │           ├── MediaScannerService.kt       # 核心后台服务
 │           ├── StorageReceiver.kt           # 存储设备广播接收器
 │           ├── BootReceiver.kt              # 开机完成广播接收器
+│           │
+│           ├── discovery/                      # 卷发现策略层（可插拔）
+│           │   ├── VolumeDiscoveryService.kt        # 卷发现抽象接口
+│           │   ├── NativeAndroidVolumeDiscovery.kt  # 原生 Android 实现（vold 广播）
+│           │   └── CustomPathVolumeDiscovery.kt     # 自定义路径实现（供应商适配）
 │           │
 │           ├── storage/                     # 存储卷管理层
 │           │   ├── StorageManager.kt        # 卷管理协调器
@@ -330,28 +336,109 @@ enum class VolumeType {
 }
 
 enum class VolumeState {
-    MOUNTED,     // 已挂载，等待扫描
+    MOUNTED,     // 已挂载，等待扫描（新卷入口）
+    ACTIVE,      // 已知卷重新插入，待增量扫描
     SCANNING,    // 正在扫描中
     READY,       // 扫描完成，数据可用
-    REMOVED,     // 已移除
+    REMOVED,     // 已移除（软删除，保留 scan_snapshot）
     FAILED       // 扫描失败
 }
 ```
 
-**事件处理**:
+**卷发现策略抽象**: `VolumeDiscoveryService`
 
-| 系统事件                | StorageManager 处理                 |
-|---------------------|-----------------------------------|
-| `MEDIA_MOUNTED`     | 创建 Volume → 通知 ScanScheduler 开始扫描 |
-| `MEDIA_UNMOUNTED`   | 停止该 Volume 的扫描任务 → 标记为 REMOVED    |
-| `MEDIA_BAD_REMOVAL` | 同上，增加异常日志                         |
-| `MEDIA_EJECT`       | 正常卸载流程                            |
+`StorageManager` 不直接依赖系统广播，而是通过 `VolumeDiscoveryService` 接口获取卷发现能力：
+
+```kotlin
+interface VolumeDiscoveryService {
+    /** 发现当前所有已挂载的存储卷（开机/初始化调用） */
+    suspend fun discoverVolumes(): List<DiscoveredVolume>
+
+    /** 实时监听卷挂载/卸载/异常拔出事件（热插拔场景） */
+    fun observeVolumeEvents(): Flow<VolumeEvent>
+
+    /** 检查指定路径是否属于已挂载卷 */
+    suspend fun resolveVolume(path: String): DiscoveredVolume?
+}
+
+data class DiscoveredVolume(
+    val identity: VolumeIdentity,
+    val mountPath: String,
+    val label: String,
+    val type: VolumeType,          // USB / SDCARD / INTERNAL / CUSTOM
+    val totalBytes: Long,
+    val availableBytes: Long,
+    val isReadOnly: Boolean = false
+)
+
+data class VolumeIdentity(
+    val uuid: String?,             // 文件系统 UUID
+    val serial: String?,           // 设备序列号
+    val customId: String? = null   // 供应商自定义标识
+)
+
+sealed class VolumeEvent {
+    data class Mounted(val volume: DiscoveredVolume) : VolumeEvent()
+    data class Unmounted(val identity: VolumeIdentity, val mountPath: String) : VolumeEvent()
+    data class BadRemoval(val identity: VolumeIdentity, val mountPath: String) : VolumeEvent()
+}
+```
+
+**默认实现**: `NativeAndroidVolumeDiscovery`
+- 通过 `StorageManager.getStorageVolumes()` 发现卷
+- 通过 `MEDIA_MOUNTED` / `MEDIA_UNMOUNTED` / `MEDIA_BAD_REMOVAL` 广播监听热插拔
+- 广播接收逻辑内聚在实现类内部，不再暴露独立的 `StorageReceiver`
+
+**供应商自定义实现**: `CustomPathVolumeDiscovery`
+- 适用于 USB 挂载到非标准路径的场景（如 `/nmt/media_raw`、`/mnt/usb_storage` 等）
+- 通过 `FileObserver` + 周期性轮询监控指定目录
+- 配置路径: `/system/etc/media_scanner_volume_paths.json`
+- 卷身份标识: 优先使用 `blkid` 获取文件系统 UUID，兜底使用挂载路径 hash
+
+**StorageManager 依赖注入**:
+
+```kotlin
+class StorageManager(
+    private val database: MediaDatabase,
+    private val discoveryService: VolumeDiscoveryService  // ★ 注入抽象
+) {
+    suspend fun initialize() {
+        // 开机恢复：通过抽象接口发现卷
+        val discovered = discoveryService.discoverVolumes()
+        reconcileVolumes(discovered)
+
+        // 热插拔监听：通过抽象接口订阅事件
+        discoveryService.observeVolumeEvents().collect { event ->
+            when (event) {
+                is VolumeEvent.Mounted -> onVolumeMounted(event.volume)
+                is VolumeEvent.Unmounted -> onVolumeUnmounted(event.identity, event.mountPath)
+                is VolumeEvent.BadRemoval -> onVolumeBadRemoval(event.identity, event.mountPath)
+            }
+        }
+    }
+}
+```
+
+**策略选择**: `MediaScannerApplication.onCreate()` 中根据配置文件选择实现：
+
+```kotlin
+private fun createDiscoveryService(): VolumeDiscoveryService {
+    val configFile = File("/system/etc/media_scanner_volume_paths.json")
+    return if (configFile.exists()) {
+        CustomPathVolumeDiscovery(parseConfig(configFile))
+    } else {
+        NativeAndroidVolumeDiscovery(this, getSystemService(StorageManager::class.java))
+    }
+}
+```
 
 **关键设计决策**:
 
 1. **Volume 持久化**: `StorageEntity` 存入 Room，开机后可恢复上次状态
-2. **重复挂载去重**: 通过 `path` + `volumeId` 组合唯一索引防止重复注册
+2. **重复挂载去重**: 通过 `VolumeIdentity` (uuid + serial + mountPath) 组合唯一索引防止重复注册
 3. **并发安全**: 使用 `ConcurrentHashMap` 管理 Volume 注册表
+4. **策略可替换**: 卷发现通过 `VolumeDiscoveryService` 接口抽象，新增供应商只需实现接口，不改动核心逻辑
+5. **FileObserver 兜底**: `CustomPathVolumeDiscovery` 以 FileObserver 为主、轮询为兜底，防止 inotify 事件遗漏
 
 ### 5.3 ScanScheduler - 扫描调度器
 
@@ -727,10 +814,13 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
          │ 发送 MEDIA_MOUNTED 广播
          ▼
 ┌──────────────────┐
-│  StorageReceiver  │
-│  onReceive()      │
+│ VolumeDiscovery   │
+│ Service           │
+│ (observeVolume-   │
+│  Events)          │
 └────────┬─────────┘
          │
+         │ VolumeEvent.Mounted
          ▼
 ┌──────────────────┐
 │  StorageManager   │
@@ -809,8 +899,10 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
          │ 发送 MEDIA_UNMOUNTED 广播
          ▼
 ┌──────────────────┐
-│  StorageReceiver  │
-│  onReceive()      │
+│ VolumeDiscovery   │
+│ Service           │
+│ → VolumeEvent     │
+│   .Unmounted      │
 └────────┬─────────┘
          │
          ▼
@@ -868,18 +960,20 @@ val uri = Uri.parse("content://com.txzing.media.scanner.provider/media/type/audi
 │  MediaScannerApplication          │
 │  onCreate()                      │
 │  1. 初始化 Room Database         │
-│  2. 初始化 StorageManager        │
-│  3. 初始化 ScanScheduler         │
+│  2. 选择 VolumeDiscoveryService  │
+│     实现（标准/CustomPath）      │
+│  3. 注入 StorageManager          │
+│  4. 初始化 ScanScheduler         │
 └────────┬─────────────────────────┘
          │
          ▼
 ┌──────────────────────────────────┐
-│  StorageManager.refreshVolumes()  │
-│  1. 通过 StorageManagerService    │
-│     获取当前挂载的存储卷列表       │
+│  StorageManager.initialize()      │
+│  1. 通过 VolumeDiscoveryService  │
+│     .discoverVolumes() 发现卷    │
 │  2. 与 DB 中记录的 Volume 对比    │
 │     - 新卷: 创建并触发扫描        │
-│     - 已存在: 恢复状态 READY      │
+│     - 已存在: 恢复状态 ACTIVE     │
 │     - 已拔出: 标记 REMOVED        │
 └────────┬─────────────────────────┘
          │

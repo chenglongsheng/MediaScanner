@@ -1,7 +1,7 @@
 # 车载媒体扫描系统 产品需求文档 (PRD)
 
-> **文档版本**: V1.2  
-> **文档状态**: 产品终审已通过  
+> **文档版本**: V1.3  
+> **文档状态**: 产品终审已通过（设计评审修订中）  
 > **作者**: -  
 > **最后更新**: 2026-07-11  
 > **保密等级**: 内部  
@@ -16,6 +16,7 @@
 | V1.0   | 2026-07-11 | -    | 完善需求场景、功能规格、验收标准 |
 | V1.1   | 2026-07-11 | -    | 开发评审修订: 性能数据标注为预期目标；USB重插改为增量扫描+卷识别；格式支持改为系统API检测+自定义配置；签名降级为signatureOrSystem+白名单；并发改为单线程时间片轮转；移除:scanner子进程 |
 | V1.2   | 2026-07-11 | -    | 产品终审: 修复3.1数据口径不一致；补全F01 ACTIVE状态；补全F10/F12/F13/F17详细规格；新增DESIGN.md交叉引用；新增产品终审结论章节 |
+| V1.3   | 2026-07-11 | -    | 工程设计评审: 新增F18可插拔卷发现策略，适配供应商非标准USB挂载路径（如/nmt/media_raw）；DESIGN.md同步新增VolumeDiscoveryService抽象层 |
 
 ---
 
@@ -50,6 +51,16 @@ Android 车载系统（Android Automotive OS）已成为各大车厂智能座舱
 - 上层播放器应用在不同车型上行为不一致
 - 应用开发方需要为每个车型做适配，**平台迁移成本极高**
 - 部分车型甚至在 Framework 层完全移除了媒体扫描能力
+
+> **供应商差异典型案例**:
+> 
+> | 供应商类型 | USB 挂载路径 | 发现机制 | 影响 |
+> |-----------|-------------|---------|------|
+> | 标准 Android | `/storage/XXXX-XXXX` | vold → StorageManagerService | 原生 API 可用 |
+> | 供应商 A（Linux 定制） | `/nmt/media_raw/` | 内核 automount，不走 vold | 无 MEDIA_MOUNTED 广播，StorageManagerService 不可见 |
+> | 供应商 B（嵌入式方案） | `/mnt/usb_storage/` | 自定义 udev 规则 | 无 Android 卷管理 |
+> 
+> 因此卷发现机制**必须可插拔**，不能与原生 Android vold/StorageManagerService 耦合。
 
 #### 痛点三：多 USB 场景无法并行处理
 
@@ -146,6 +157,7 @@ Android 车载系统（Android Automotive OS）已成为各大车厂智能座舱
 | **F15** | 按存储卷过滤查询       | P1     | 支持按卷 ID 查询指定 USB 的媒体 |
 | **F16** | 损坏文件容错           | P0     | 单个文件解析失败不影响整体扫描 |
 | **F17** | 文件校验               | P2     | 通过 magic bytes 校验文件真实类型 |
+| **F18** | 可插拔卷发现策略       | P0     | 支持标准 Android 和供应商自定义路径两种卷发现策略，运行时切换 |
 
 ### 4.2 详细功能规格
 
@@ -277,6 +289,18 @@ Android 车载系统（Android Automotive OS）已成为各大车厂智能座舱
 | **描述**  | 通过 magic bytes（文件头魔数）校验文件真实类型，防止扩展名伪装。例如 `.mp3` 文件实际为 `ID3` 头，`.png` 文件以 `‰PNG` 开头 |
 | **优先级** | P2 — V1.0 仅对图片和音频做文件头校验；视频格式暂不做（文件体积大，头校验代价高） |
 | **异常策略** | 校验不通过：标记为 `UNKNOWN` 类型，保留基本字段（路径、大小、修改时间），不提取元数据。不阻塞扫描流程 |
+
+#### F18: 可插拔卷发现策略
+
+| 项        | 说明                                                         |
+| --------- | ------------------------------------------------------------ |
+| **描述**  | 将存储卷发现机制抽象为 `VolumeDiscoveryService` 接口，支持运行时在"原生 Android 实现"和"供应商自定义路径实现"之间切换。解决不同供应商 USB 挂载路径不一致（如 `/nmt/media_raw`）导致的扫描服务无法感知存储卷的问题 |
+| **优先级** | P0 — 卷发现是扫描的入口，若无法正确发现卷则整个系统不可用 |
+| **策略一: 原生实现** | `NativeAndroidVolumeDiscovery`：通过 `StorageManager.getStorageVolumes()` 发现卷 + 监听 `MEDIA_MOUNTED`/`MEDIA_UNMOUNTED` 广播感知热插拔。适用于标准 Android 设备 |
+| **策略二: 自定义路径实现** | `CustomPathVolumeDiscovery`：通过 `FileObserver` + 轮询机制监控配置文件中指定的路径（如 `/nmt/media_raw/`），发现子目录作为卷。配置路径: `/system/etc/media_scanner_volume_paths.json`。卷身份标识优先使用 `blkid` 获取 UUID，兜底使用路径 hash |
+| **策略选择** | `MediaScannerApplication.onCreate()` 启动时检测配置文件是否存在：存在则使用 `CustomPathVolumeDiscovery`，否则使用 `NativeAndroidVolumeDiscovery` |
+| **配置文件格式** | `{ "watchPaths": ["/nmt/media_raw"], "pollIntervalMs": 30000, "volumeTypeMapping": {"/nmt/media_raw": "USB"}, "excludePaths": ["/nmt/media_raw/lost+found"] }` |
+| **设计原则** | 新增供应商只需新增一个 `VolumeDiscoveryService` 实现，不改动 `StorageManager` / `ScanScheduler` 等核心模块 |
 
 ---
 
@@ -414,7 +438,7 @@ Android 车载系统（Android Automotive OS）已成为各大车厂智能座舱
 | 2 | 目标量化 | ✅ 通过 | 9 项 KPI 均可测量，实验设计明确测试条件；性能数据已标注为设计目标 |
 | 3 | 范围边界 | ✅ 通过 | In-Scope/Out-of-Scope/Future Roadmap 三层清晰，无歧义 |
 | 4 | 用户故事 | ✅ 通过 | 7 个故事覆盖车主、开发者、集成商、QA 四类角色，验收标准可执行 |
-| 5 | 技术可行性 | ✅ 通过 | 架构方案在 DESIGN.md 中细化，独立 APK + 自建数据库 + 单线程时间片调度方案可行 |
+| 5 | 技术可行性 | ✅ 通过 | 架构方案在 DESIGN.md 中细化，独立 APK + 自建数据库 + 单线程时间片调度方案可行。**V1.3 新增**：卷发现策略抽象化（`VolumeDiscoveryService`），解决供应商 USB 挂载路径差异 |
 | 6 | 安全合规 | ✅ 通过 | signatureOrSystem + 白名单兼顾安全性与生态兼容性 |
 
 ### 遗留风险与建议
@@ -422,15 +446,16 @@ Android 车载系统（Android Automotive OS）已成为各大车厂智能座舱
 | 风险项 | 建议 | 责任人 |
 |--------|------|--------|
 | 性能数据为设计目标，非实测 | 开发 P0 阶段完成 10000 文件实测基线采集，若与目标偏差 > 30% 需回溯方案 | 开发负责人 |
-| DESIGN.md 与 PRD V1.1 存在架构不一致 | **需同步更新 DESIGN.md**（并发模型、签名级别、子进程、USB 插入流程等） | 架构师 |
+| DESIGN.md 与 PRD 的架构一致性 | V1.3 已完成 DESIGN.md 架构同步（卷发现策略抽象化），后续变更需同步更新 | 架构师 |
+| 供应商非标准挂载路径 | V1.3 新增 `CustomPathVolumeDiscovery` + 配置文件机制，覆盖率待各供应商实测验证 | 开发负责人 |
 | 白名单配置文件的 OTA 升级流程 | 需与车厂 OTA 团队对齐配置文件更新机制 | PM + 车厂集成方 |
 | 时间片轮转的上下文保存/恢复 | 需在 ScannerEngine 中设计 scan_snapshot 数据结构和恢复协议 | 开发负责人 |
 
 ### 终审结论
 
-> **评审通过，PRD V1.1 可作为开发排期与验收依据。**
+> **评审通过，PRD V1.3 可作为开发排期与验收依据。**
 > 
-> 前置条件：DESIGN.md 需在开发启动前完成与 PRD V1.1 的架构同步。
+> **V1.3 工程设计评审要点**：补充了卷发现策略抽象化设计（`VolumeDiscoveryService` 接口 + 双实现），适配供应商非标准 USB 挂载路径。DESIGN.md 已同步更新架构。
 
 ---
 
